@@ -76,6 +76,11 @@ python train_noisy_final.py -s <source_image_path> -m <model_path> \
 
 **Outputs:**
 
+* Reconstructed image:
+  ```
+  <model_path>/train/ours_<iterations>/renders/00000.png
+  ```
+
 * Denoised image:
 
   ```

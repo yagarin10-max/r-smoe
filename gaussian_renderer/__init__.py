@@ -15,6 +15,23 @@ from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianR
 from scene.gaussian_model import GaussianModel
 from utils.sh_utils import eval_sh
 
+# train_render_metrics_final.py 等の適切な場所に追加
+def render_gaussian_shapes(viewpoint_camera, pc, pipe, bg_color):
+    """
+    各ガウス関数にランダムな色を割り当てて、形状を可視化する
+    """
+    # 1. 各ガウス関数に固定のランダム色を生成 (学習には使わない)
+    # 以前のコードにある random_colors の役割
+    torch.manual_seed(42) # 常に同じ色を割り当てるため
+    random_colors = torch.rand((pc.get_xyz.shape[0], 3), device="cuda")
+    
+    # 2. render関数を呼び出すが、override_color 引数を使って色を上書きする
+    # pc.get_features (SH) の代わりに random_colors を使う
+    from gaussian_renderer import render
+    render_pkg = render(viewpoint_camera, pc, pipe, bg_color, override_color=random_colors)
+    
+    return render_pkg["render"]
+
 def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None):
     """
     Render the scene. 

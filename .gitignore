@@ -1,0 +1,17 @@
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Build and binary files
+build/
+dist/
+*.so
+*.egg-info/
+
+# Outputs and data
+output/
+temp/
+all_result/
+data/*/temp/

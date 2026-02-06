@@ -13,7 +13,7 @@ import os
 import torch
 from random import randint
 from utils.loss_utils import l1_loss, ssim, l2_loss
-from gaussian_renderer import render, network_gui
+from gaussian_renderer import render, network_gui, render_gaussian_shapes
 import sys
 from scene import Scene, GaussianModel
 from utils.general_utils import safe_state
@@ -30,7 +30,7 @@ from utils.loss_utils import ssim
 from lpipsPyTorch import lpips
 import json
 import torchvision
-
+import matplotlib.pyplot as plt
 
 try:
     from torch.utils.tensorboard import SummaryWriter
@@ -191,9 +191,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
     render_path = os.path.join(scene.model_path, 'train', "ours_{}".format(opt.iterations), "renders")
     gts_path = os.path.join(scene.model_path, 'train', "ours_{}".format(opt.iterations), "gt")
-
+    render_points_path = os.path.join(scene.model_path, 'train', "ours_{}".format(opt.iterations), "points_overlay")
+    gauss_render_path = os.path.join(scene.model_path, 'train', "ours_{}".format(opt.iterations), "gauss_renders")
     makedirs(render_path, exist_ok=True)
     makedirs(gts_path, exist_ok=True)
+    makedirs(render_points_path, exist_ok=True)
+    makedirs(gauss_render_path, exist_ok=True)
     iter_start = torch.cuda.Event(enable_timing = True)
     iter_end = torch.cuda.Event(enable_timing = True)
     rendering_time = 0
@@ -217,6 +220,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         ssims.append(ssim(rendering, gt))
         psnrs.append(psnr(rendering, gt).mean())
         lpipss.append(lpips(rendering, gt, net_type='vgg'))
+
+        # --- 呼び出し側の例 (Iterationの最後など) ---
+        point_render_path = os.path.join(render_points_path, '{0:05d}_pts.png'.format(idx))
+        save_points_overlay(rendering, gaussians, viewpoint_cam, point_render_path)
+        print(f"Point overlay saved to {point_render_path}")
+        black_bg = torch.tensor([0, 0, 0], dtype=torch.float32, device="cuda")
+        gauss_shapes = torch.clamp(render_gaussian_shapes(viewpoint_cam, gaussians, pipe, black_bg), 0.0, 1.0)
+        save_points_overlay(gauss_shapes, gaussians, viewpoint_cam, os.path.join(gauss_render_path, '{0:05d}_gauss.png'.format(idx)))
 
     print("  SSIM : {:>12.7f}".format(torch.tensor(ssims).mean(), ".5"))
     print("  PSNR : {:>12.7f}".format(torch.tensor(psnrs).mean(), ".5"))
@@ -255,6 +266,43 @@ def prepare_output_and_logger(args):
     else:
         print("Tensorboard not available: not logging progress")
     return tb_writer
+
+def save_points_overlay(render_img, gaussians, viewpoint_cam, save_path):
+    """
+    レンダリング画像の上にガウス関数の中心点をプロットして保存する
+    """
+    # 1. データの準備
+    img_np = render_img.permute(1, 2, 0).detach().cpu().numpy()
+    h, w, _ = img_np.shape
+    
+    # 3D中心点 (xyz) をスクリーン座標 (2D) に投影
+    # R-SMoEでは z=0 平面に配置されている前提だが、レンダラーの投影行列を使うのが確実
+    # ここではシンプルに現在のxyzから2D位置を取得
+    xyz = gaussians.get_xyz.detach().cpu().numpy()
+    
+    # R-SMoEの正規化範囲 (-1 to 1) をピクセル座標に変換
+    # scene/__init__.py の初期化ロジックと合わせる
+    points_x = (xyz[:, 0] / 2 + 0.5) * viewpoint_cam.image_width
+    points_y = (xyz[:, 1] / 2 + 0.5) * viewpoint_cam.image_height
+    
+    # 不透明度によるフィルタリング (ほぼ透明な点を除外)
+    opacities = gaussians.get_opacity.detach().cpu().numpy().squeeze()
+    valid_indices = (opacities > 0.05) & \
+                (points_x >= 0) & (points_x < viewpoint_cam.image_width) & \
+                (points_y >= 0) & (points_y < viewpoint_cam.image_height)
+    # 2. 描画
+    fig, ax = plt.subplots(figsize=(w/100, h/100), dpi=100)
+    ax.imshow(img_np)
+    ax.scatter(points_x[valid_indices], points_y[valid_indices], 
+            s=1, c='lime', marker='o', alpha=0.8, edgecolors='none')
+    
+    ax.axis('off')
+    plt.subplots_adjust(top=1, bottom=0, right=1, left=0, hspace=0, wspace=0)
+    plt.margins(0, 0)
+    
+    # 3. 保存
+    plt.savefig(save_path, bbox_inches='tight', pad_inches=0)
+    plt.close(fig)
 
 def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs,dataset):
     #print(tb_writer)

@@ -47,6 +47,7 @@ class GaussianModel:
 
         self.opacity_activation = torch.sigmoid
         self.inverse_opacity_activation = inverse_sigmoid
+        self.mask_activation = torch.sigmoid
 
         self.rotation_activation = torch.nn.functional.normalize
         
@@ -70,6 +71,7 @@ class GaussianModel:
         self.setup_functions()
         self._feature_indices = None
         self._gaussian_indices = None
+        self.init_logits = 3.0
 
     def capture(self):
         return (
@@ -136,12 +138,25 @@ class GaussianModel:
     def get_opacity(self):
         return self.opacity_activation(self._opacity)
     
+    @property
+    def get_mask(self):
+        return self.mask_activation(self._mask_logits)
+    
     def get_covariance(self, scaling_modifier = 1):
         return self.covariance_activation(self.get_scaling, scaling_modifier, self._rotation)
 
     def oneupSHdegree(self):
         if self.active_sh_degree < self.max_sh_degree:
             self.active_sh_degree += 1
+
+    def gumbel_sigmoid(self, logits, temperature=1.0, hard=False):
+        gumbels = -torch.empty_like(logits).exponential_().log()  # Gumbelノイズ
+        y_soft = torch.sigmoid((logits + gumbels) / temperature)
+        
+        if hard:
+            y_hard = (y_soft > 0.5).float()
+            y_soft = y_hard - y_soft.detach() + y_soft  # Straight-through estimator
+        return y_soft
 
     def create_from_pcd_3d(self, pcd : BasicPointCloud, spatial_lr_scale : float):
         self.spatial_lr_scale = spatial_lr_scale
@@ -204,27 +219,39 @@ class GaussianModel:
         self._rotation = nn.Parameter(rots.requires_grad_(True))
         self._opacity = nn.Parameter(opacities.requires_grad_(True))
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+        self._mask_logits = nn.Parameter(torch.ones((self.get_xyz.shape[0], 1), device="cuda") * self.init_logits, requires_grad=True)
 
     def training_setup(self, training_args):
         self.percent_dense = training_args.percent_dense
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         print(training_args.position_lr_init, self.spatial_lr_scale)
+        #TODO: add mask logits learning rate to args
         l = [
             {'params': [self._xyz], 'lr': training_args.position_lr_init, "name": "xyz"},#training_args.position_lr_init * self.spatial_lr_scale
             {'params': [self._features_dc], 'lr': training_args.feature_lr, "name": "f_dc"},
             {'params': [self._features_rest], 'lr': training_args.feature_lr / 20.0, "name": "f_rest"},
             {'params': [self._opacity], 'lr': training_args.opacity_lr, "name": "opacity"},
             {'params': [self._scaling], 'lr': training_args.scaling_lr, "name": "scaling"},
-            {'params': [self._rotation], 'lr': training_args.rotation_lr, "name": "rotation"}
+            {'params': [self._rotation], 'lr': training_args.rotation_lr, "name": "rotation"},
+            {'params': [self._mask_logits], 'lr': 0.01, "name": "mask_logits"}
         ]
-
         self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
         self.xyz_scheduler_args = get_expon_lr_func(lr_init=training_args.position_lr_init,#*self.spatial_lr_scale,
                                                     lr_final=training_args.position_lr_final,#*self.spatial_lr_scale,
                                                     lr_delay_mult=training_args.position_lr_delay_mult,
                                                     max_steps=training_args.position_lr_max_steps)
         
+    def modify_mask_activation(self, pruning_mode):
+        if pruning_mode == "soft":
+            self.mask_activation = lambda x: self.gumbel_sigmoid(x, temperature=1.0, hard=False)
+        elif pruning_mode == "deterministic":
+            with torch.no_grad():
+                self.fixed_mask = (torch.sigmoid(self._mask_logits) > 0.5).float().detach()
+            self.mask_activation = lambda x: self.fixed_mask  
+            # print(f"Mask fixed. Active points: {self.fixed_mask.sum().item()}") 
+        else:
+            self.mask_activation = torch.sigmoid
 
     def update_learning_rate(self, iteration):
         ''' Learning rate scheduling per step '''

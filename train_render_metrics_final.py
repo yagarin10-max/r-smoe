@@ -79,7 +79,17 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     current_loss = 1000000
     losses = []
     times = []
-    for iteration in range(first_iter, opt.iterations + 1):        
+    for iteration in range(first_iter, opt.iterations + 1):  
+        if not args.use_mask:
+            pruning_mode = None
+        elif iteration < args.start_mask_training:
+            pruning_mode = None
+        elif iteration < args.stop_mask_training:
+            pruning_mode = "soft"
+        else:
+            pruning_mode = "deterministic"
+        gaussians.modify_mask_activation(pruning_mode=pruning_mode)
+   
         if network_gui.conn == None:
             network_gui.try_connect()
         while network_gui.conn != None:
@@ -129,6 +139,16 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         #loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
         loss = (1.0 - opt.lambda_dssim) * Ll2 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
+        
+        loss_kl = torch.tensor(0.0).cuda()
+        if args.use_mask and args.start_mask_training <= iteration < args.stop_mask_training:
+            mask_probs = torch.sigmoid(gaussians._mask_logits)
+            current_rho = torch.mean(mask_probs).clamp(1e-5, 1.0 - 1e-5)
+            target_rho = torch.tensor(args.target_sparsity).cuda().clamp(1e-5, 1.0 - 1e-5)
+            loss_kl = target_rho * torch.log(target_rho / current_rho) + \
+                    (1 - target_rho) * torch.log((1 - target_rho) / (1 - current_rho))
+            loss += args.lambda_kl * loss_kl
+
         loss.backward()
 
         iter_end.record()
@@ -378,6 +398,12 @@ if __name__ == "__main__":
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--start_checkpoint", type=str, default = None)
     parser.add_argument("--file_name", type=str, default = 'new_dataset')
+
+    parser.add_argument("--use_mask", action='store_true', help="Enable mask training")
+    parser.add_argument("--start_mask_training", type=int, default=1000)
+    parser.add_argument("--stop_mask_training", type=int, default=4000)
+    parser.add_argument("--target_sparsity", type=float, default=0.8, help="Target density (rho) for KL divergence")
+    parser.add_argument("--lambda_kl", type=float, default=0.0005, help="Weight of KL divergence loss")
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
     print(args.npcs)

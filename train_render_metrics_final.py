@@ -31,6 +31,7 @@ from lpipsPyTorch import lpips
 import json
 import torchvision
 import matplotlib.pyplot as plt
+import wandb
 
 try:
     from torch.utils.tensorboard import SummaryWriter
@@ -85,11 +86,21 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         elif iteration < args.start_mask_training:
             pruning_mode = None
         elif iteration < args.stop_mask_training:
-            pruning_mode = "soft"
+            pruning_mode = "hard"
         else:
             pruning_mode = "deterministic"
         gaussians.modify_mask_activation(pruning_mode=pruning_mode)
-   
+        if pruning_mode == "deterministic" and iteration == args.stop_mask_training:
+            with torch.no_grad():
+                mask_values = gaussians.get_mask.detach()
+                print(f"\n--- Mask Check at Iter {iteration} ---")
+                print(f"Max: {mask_values.max().item()}")
+                print(f"Min: {mask_values.min().item()}")
+                print(f"Mean: {mask_values.mean().item()}")
+                # 0.0 と 1.0 以外の値がどれくらいあるか
+                non_binary = ((mask_values > 0.01) & (mask_values < 0.99)).sum().item()
+                print(f"Non-binary values (between 0 and 1): {non_binary}")
+                gaussians.prune_with_mask()
         if network_gui.conn == None:
             network_gui.try_connect()
         while network_gui.conn != None:
@@ -202,6 +213,34 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 gaussians.optimizer.step()
                 gaussians.optimizer.zero_grad(set_to_none = True)
 
+            if iteration % 10 == 0:
+                with torch.no_grad():
+                    # 1. PSNRの計算
+                    psnr_val = psnr(image, gt_image).mean().item()
+                    # 2. 学習率の取得 (xyz)
+                    current_lr = 0.0
+                    for param_group in gaussians.optimizer.param_groups:
+                        if param_group["name"] == "xyz":
+                            current_lr = param_group["lr"]
+                    # 3. 有効ポイント数の計算
+                    if args.use_mask:
+                        mask_probs = torch.sigmoid(gaussians._mask_logits)
+                        active_count = (mask_probs > 0.5).sum().item()
+                        mean_prob = torch.mean(mask_probs).item()
+                    else:
+                        active_count = gaussians.get_xyz.shape[0]
+                        mean_prob = 1.0
+
+                    # WandBへ送信
+                    wandb.log({
+                        "iter": iteration,
+                        "train/loss_total": loss.item(),
+                        "train/psnr": psnr_val,
+                        "train/lr": current_lr,
+                        "stats/active_points": active_count,
+                        "mask/mean_prob": mean_prob,
+                        "loss/kl": loss_kl.item() if args.use_mask else 0,
+                    })
             if (iteration in checkpoint_iterations):
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
                 torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
@@ -241,7 +280,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         psnrs.append(psnr(rendering, gt).mean())
         lpipss.append(lpips(rendering, gt, net_type='vgg'))
 
-        # --- 呼び出し側の例 (Iterationの最後など) ---
         point_render_path = os.path.join(render_points_path, '{0:05d}_pts.png'.format(idx))
         save_points_overlay(rendering, gaussians, viewpoint_cam, point_render_path)
         print(f"Point overlay saved to {point_render_path}")
@@ -249,6 +287,17 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         gauss_shapes = torch.clamp(render_gaussian_shapes(viewpoint_cam, gaussians, pipe, black_bg), 0.0, 1.0)
         save_points_overlay(gauss_shapes, gaussians, viewpoint_cam, os.path.join(gauss_render_path, '{0:05d}_gauss.png'.format(idx)))
 
+    final_ssim = torch.tensor(ssims).mean().item()
+    final_psnr = torch.tensor(psnrs).mean().item()
+    final_lpips = torch.tensor(lpipss).mean().item()
+
+    wandb.log({
+        "final/ssim": final_ssim,
+        "final/psnr": final_psnr,
+        "final/lpips": final_lpips,
+        "final/active_points": active_count,
+        "final/render_example": wandb.Image(rendering, caption=f"Final PSNR: {final_psnr:.2f}")
+    })
     print("  SSIM : {:>12.7f}".format(torch.tensor(ssims).mean(), ".5"))
     print("  PSNR : {:>12.7f}".format(torch.tensor(psnrs).mean(), ".5"))
     print("  LPIPS: {:>12.7f}".format(torch.tensor(lpipss).mean(), ".5"))
@@ -307,6 +356,8 @@ def save_points_overlay(render_img, gaussians, viewpoint_cam, save_path):
     
     # 不透明度によるフィルタリング (ほぼ透明な点を除外)
     opacities = gaussians.get_opacity.detach().cpu().numpy().squeeze()
+    masks = gaussians.get_mask.detach().cpu().numpy().squeeze()
+    opacities = opacities * masks if masks is not None else opacities
     valid_indices = (opacities > 0.05) & \
                 (points_x >= 0) & (points_x < viewpoint_cam.image_width) & \
                 (points_y >= 0) & (points_y < viewpoint_cam.image_height)
@@ -409,6 +460,11 @@ if __name__ == "__main__":
     print(args.npcs)
     #lp.npcs = args.npcs
     
+    wandb.init(
+        project="r-smoe-mask-learning", # プロジェクト名
+        name=args.file_name,
+        config=vars(args)
+    )
     print("Optimizing " + args.model_path)
 
     # Initialize system state (RNG)

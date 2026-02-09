@@ -63,6 +63,7 @@ class GaussianModel:
         self._rotation = torch.empty(0)
         self._opacity = torch.empty(0)
         self.max_radii2D = torch.empty(0)
+        self._mask_logits = torch.empty(0)
         self.xyz_gradient_accum = torch.empty(0)
         self.denom = torch.empty(0)
         self.optimizer = None
@@ -140,6 +141,8 @@ class GaussianModel:
     
     @property
     def get_mask(self):
+        if self.mask_activation is None:
+            return None
         return self.mask_activation(self._mask_logits)
     
     def get_covariance(self, scaling_modifier = 1):
@@ -211,7 +214,7 @@ class GaussianModel:
         rots[:, 1] = 0
 
         opacities = inverse_sigmoid(0.1 * torch.ones((fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda"))
-
+        logits = torch.ones((fused_point_cloud.shape[0], 1), device="cuda") * self.init_logits
         self._xyz = nn.Parameter(fused_point_cloud.requires_grad_(True))
         self._features_dc = nn.Parameter(features[:,:,0:1].transpose(1, 2).contiguous().requires_grad_(True))
         self._features_rest = nn.Parameter(features[:,:,1:].transpose(1, 2).contiguous().requires_grad_(True))
@@ -219,7 +222,7 @@ class GaussianModel:
         self._rotation = nn.Parameter(rots.requires_grad_(True))
         self._opacity = nn.Parameter(opacities.requires_grad_(True))
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
-        self._mask_logits = nn.Parameter(torch.ones((self.get_xyz.shape[0], 1), device="cuda") * self.init_logits, requires_grad=True)
+        self._mask_logits = nn.Parameter(logits.requires_grad_(True))
 
     def training_setup(self, training_args):
         self.percent_dense = training_args.percent_dense
@@ -243,8 +246,12 @@ class GaussianModel:
                                                     max_steps=training_args.position_lr_max_steps)
         
     def modify_mask_activation(self, pruning_mode):
-        if pruning_mode == "soft":
+        if pruning_mode == None:
+            self.mask_activation = None
+        elif pruning_mode == "soft":
             self.mask_activation = lambda x: self.gumbel_sigmoid(x, temperature=1.0, hard=False)
+        elif pruning_mode == "hard":
+            self.mask_activation = lambda x: self.gumbel_sigmoid(x, temperature=1.0, hard=True)
         elif pruning_mode == "deterministic":
             with torch.no_grad():
                 self.fixed_mask = (torch.sigmoid(self._mask_logits) > 0.5).float().detach()
@@ -252,6 +259,23 @@ class GaussianModel:
             # print(f"Mask fixed. Active points: {self.fixed_mask.sum().item()}") 
         else:
             self.mask_activation = torch.sigmoid
+
+    def prune_with_mask(self, threshold=0.5):
+        with torch.no_grad():
+            probs = torch.sigmoid(self._mask_logits)
+            valid_indices = (probs > threshold).squeeze()
+        self._xyz = nn.Parameter(self._xyz[valid_indices])
+        self._features_dc = nn.Parameter(self._features_dc[valid_indices])
+        self._features_rest = nn.Parameter(self._features_rest[valid_indices])
+        self._mask_logits = nn.Parameter(self._mask_logits[valid_indices])
+        self._opacity = nn.Parameter(self._opacity[valid_indices])
+        self._scaling = nn.Parameter(self._scaling[valid_indices])
+        self._rotation = nn.Parameter(self._rotation[valid_indices])
+        with torch.no_grad():
+            self.fixed_mask = torch.ones((self._xyz.shape[0], 1), device=self._xyz.device)
+        self.mask_activation = lambda x: self.fixed_mask
+        
+        print(f"Pruned points: {probs.shape[0]} to {self._xyz.shape[0]} points.")
 
     def update_learning_rate(self, iteration):
         ''' Learning rate scheduling per step '''
